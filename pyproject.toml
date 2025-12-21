@@ -1,0 +1,15 @@
+[build-system]
+requires = ["flit_core ~=3.2"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "GZMGTFS"
+authors = [{name = "Mikołaj Kuranowski", email = "mkuranowski+pypackages@gmail.com"}]
+readme = "README.md"
+dynamic = ["version"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pyright]
+typeCheckingMode = "strict"
