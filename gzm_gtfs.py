@@ -19,7 +19,7 @@ from impuls import App, LocalResource, PipelineOptions, Task, TaskRuntime
 from impuls.errors import InputNotModified
 from impuls.model import Date
 from impuls.multi_file import IntermediateFeed, IntermediateFeedProvider, MultiFile
-from impuls.tasks import LoadGTFS, SaveGTFS
+from impuls.tasks import ExecuteSQL, LoadGTFS, SaveGTFS
 
 GTFS_HEADERS = {
     "agency.txt": (
@@ -80,6 +80,61 @@ GTFS_HEADERS = {
         "block_id",
     ),
 }
+
+
+ROUTE_COLORS = [
+    # Generic route-type based colors
+    ("%", 0, "#d7006e"),
+    ("%", 3, "#fcf299"),
+    ("%", 11, "#88bb44"),
+    # Route subtype specific colors (buses)
+    ("T-%", 3, "#ffd403"),
+    ("M%", 3, "#d7006e"),
+    ("AP", 3, "#d7006e"),
+    ("%N", 3, "#000000"),
+    # Route specific colors (trolleybuses & trams)
+    ("A", 11, "#21bbef"),
+    ("B", 11, "#ea516d"),
+    ("C", 11, "#85bd41"),
+    ("D", 11, "#b94f98"),
+    ("E", 11, "#f39200"),
+    ("F", 11, "#f29fc5"),
+    ("G", 11, "#4aa0af"),
+    ("H", 11, "#fdc300"),
+    ("0", 0, "#56be86"),
+    ("1", 0, "#7cbcc7"),
+    ("2", 0, "#517f87"),
+    ("3", 0, "#addabd"),
+    ("4", 0, "#7cbcc7"),
+    ("5", 0, "#517f87"),
+    ("6", 0, "#ffd403"),
+    ("7", 0, "#f16d68"),
+    ("9", 0, "#f6abad"),
+    ("10", 0, "#ffd403"),
+    ("11", 0, "#d8c497"),
+    ("13", 0, "#4e7cbf"),
+    ("14", 0, "#f69548"),
+    ("15", 0, "#f16d68"),
+    ("16", 0, "#85bae5"),
+    ("19", 0, "#56be86"),
+    ("20", 0, "#f16d68"),
+    ("21", 0, "#7e71b4"),
+    ("22", 0, "#7e71b4"),
+    ("24", 0, "#c6afd4"),
+    ("26", 0, "#f69548"),
+    ("27", 0, "#c6afd4"),
+    ("28", 0, "#7e71b4"),
+    ("30", 0, "#517f87"),
+    ("34", 0, "#f69548"),
+    ("36", 0, "#f69548"),
+    ("38", 0, "#b66987"),
+    ("40", 0, "#f16d68"),
+    ("41", 0, "#85bae5"),
+    ("45", 0, "#f16d68"),
+    ("46", 0, "#85bae5"),
+]
+
+UPPER_CASE_WORDS = ["GCR", "GPP", "II", "III", "NFZ", "PKP", "UG", "ZWM"]
 
 
 class GZMFeedProvider(IntermediateFeedProvider[LocalResource]):
@@ -253,6 +308,43 @@ class UpdateFeedInfo(Task):
             )
 
 
+class UpdateRouteColors(Task):
+    def execute(self, r: TaskRuntime) -> None:
+        with r.db.transaction():
+            r.db.raw_execute_many(
+                "UPDATE routes SET color = ?, text_color = ? WHERE type = ? AND short_name LIKE ?",
+                (
+                    (color[1:], self.text_color_for(color[1:]), type, short_name_pattern)
+                    for short_name_pattern, type, color in ROUTE_COLORS
+                ),
+            )
+
+    @staticmethod
+    def text_color_for(color: str) -> str:
+        r = int(color[0:2], base=16)
+        g = int(color[2:4], base=16)
+        b = int(color[4:6], base=16)
+        yiq = 0.299 * r + 0.587 * g + 0.114 * b
+        return "000000" if yiq > 128 else "FFFFFF"
+
+
+class UpdateRouteLongNames(Task):
+    def execute(self, r: TaskRuntime) -> None:
+        fixed = [
+            (self.fix_long_name(i[1]), i[0])  # type: ignore
+            for i in r.db.raw_execute("SELECT route_id, long_name FROM routes")
+        ]
+        with r.db.transaction():
+            r.db.raw_execute_many("UPDATE routes SET long_name = ? WHERE route_id = ?", fixed)
+
+    @staticmethod
+    def fix_long_name(input: str) -> str:
+        s = input.title()
+        for word in UPPER_CASE_WORDS:
+            s = re.sub(f"\\b{re.escape(word)}\\b", word, s, flags=re.I)
+        return s
+
+
 class GZMGTFS(App):
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("-o", "--output", default="gzm.zip", help="path to output GTFS file")
@@ -271,10 +363,16 @@ class GZMGTFS(App):
             ],
             final_pipeline_tasks_factory=lambda _: [
                 UpdateFeedInfo(provider.pkg_date.strftime("%Y.%m.%d")),
-                SaveGTFS(
-                    headers=GTFS_HEADERS,
-                    target=args.output,
+                ExecuteSQL(
+                    statement=(
+                        "UPDATE routes SET short_name = substr(short_name, 2) "
+                        "WHERE type = 0 AND short_name LIKE 'T%'"
+                    ),
+                    task_name="UpdateTramRouteShortName",
                 ),
+                UpdateRouteColors(),
+                UpdateRouteLongNames(),
+                SaveGTFS(headers=GTFS_HEADERS, target=args.output),
             ],
         )
 
