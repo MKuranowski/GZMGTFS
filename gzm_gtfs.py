@@ -19,7 +19,8 @@ from impuls import App, LocalResource, PipelineOptions, Task, TaskRuntime
 from impuls.errors import InputNotModified
 from impuls.model import Date
 from impuls.multi_file import IntermediateFeed, IntermediateFeedProvider, MultiFile
-from impuls.tasks import ExecuteSQL, LoadGTFS, SaveGTFS
+from impuls.tasks import ExecuteSQL, ExtendCalendarsFromPolishExceptions, LoadGTFS, SaveGTFS
+from impuls.tools import polish_calendar_exceptions
 from impuls.tools.color import text_color_for
 
 GTFS_HEADERS = {
@@ -365,8 +366,15 @@ class GZMGTFS(App):
                 ),
                 UpdateRouteColors(),
                 UpdateRouteLongNames(),
+                ExtendCalendarsFromPolishExceptions(
+                    resource_name="calendar_exceptions.csv",
+                    region=polish_calendar_exceptions.PolishRegion.SLASKIE,
+                ),
                 SaveGTFS(headers=GTFS_HEADERS, target=args.output),
             ],
+            additional_resources={
+                "calendar_exceptions.csv": polish_calendar_exceptions.RESOURCE,
+            },
         )
 
 
