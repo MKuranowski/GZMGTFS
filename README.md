@@ -32,4 +32,4 @@ See `python gzm_gtfs.py --help` for a list of all available options.
 License
 -------
 
-_PolRegioGTFS_ is provided under the MIT license, included in the `LICENSE` file.
+_GZMGTFS_ is provided under the MIT license, included in the `LICENSE` file.
