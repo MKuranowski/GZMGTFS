@@ -359,6 +359,15 @@ class GZMGTFS(App):
                 UpdateFeedInfo(provider.pkg_date.strftime("%Y.%m.%d")),
                 ExecuteSQL(
                     statement=(
+                        "DELETE FROM stops WHERE name LIKE 'granica %' AND NOT EXISTS ("
+                        "  SELECT 1 FROM stop_times WHERE stops.stop_id = stop_times.stop_id "
+                        "  AND (pickup_type != 1 OR drop_off_type != 1)"
+                        ")"
+                    ),
+                    task_name="RemoveMunicipalityBorderFakeStops",
+                ),
+                ExecuteSQL(
+                    statement=(
                         "UPDATE routes SET short_name = substr(short_name, 2) "
                         "WHERE type = 0 AND short_name LIKE 'T%'"
                     ),
