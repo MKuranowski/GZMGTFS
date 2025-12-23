@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from io import TextIOWrapper
 from operator import itemgetter
 from pathlib import Path
+from typing import cast
 from zipfile import ZipFile
 
 import requests
@@ -325,7 +326,7 @@ class UpdateRouteColors(Task):
 class UpdateRouteLongNames(Task):
     def execute(self, r: TaskRuntime) -> None:
         fixed = [
-            (self.fix_long_name(i[1]), i[0])  # type: ignore
+            (self.fix_long_name(cast(str, i[1])), cast(str, i[0]))
             for i in r.db.raw_execute("SELECT route_id, long_name FROM routes")
         ]
         with r.db.transaction():
@@ -337,6 +338,29 @@ class UpdateRouteLongNames(Task):
         for word in UPPER_CASE_WORDS:
             s = re.sub(f"\\b{re.escape(word)}\\b", word, s, flags=re.I)
         return s
+
+
+class DeduplicateShapes(Task):
+    def execute(self, r: TaskRuntime) -> None:
+        deduplicated = set[str]()
+        to_process = [cast(str, i[0]) for i in r.db.raw_execute("SELECT shape_id FROM shapes")]
+
+        with r.db.transaction():
+            for original_shape_id in to_process:
+                shape_id = original_shape_id.partition(":")[2]
+
+                if shape_id in deduplicated:
+                    r.db.raw_execute(
+                        "UPDATE trips SET shape_id = ? WHERE shape_id = ?",
+                        (shape_id, original_shape_id),
+                    )
+                    r.db.raw_execute("DELETE FROM shapes WHERE shape_id = ?", (original_shape_id,))
+                else:
+                    r.db.raw_execute(
+                        "UPDATE shapes SET shape_id = ? WHERE shape_id = ?",
+                        (shape_id, original_shape_id),
+                    )
+                    deduplicated.add(shape_id)
 
 
 class GZMGTFS(App):
@@ -357,6 +381,7 @@ class GZMGTFS(App):
             ],
             final_pipeline_tasks_factory=lambda _: [
                 UpdateFeedInfo(provider.pkg_date.strftime("%Y.%m.%d")),
+                DeduplicateShapes(),
                 ExecuteSQL(
                     statement=(
                         "DELETE FROM stops WHERE name LIKE 'granica %' AND NOT EXISTS ("
