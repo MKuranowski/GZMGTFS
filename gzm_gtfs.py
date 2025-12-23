@@ -20,6 +20,7 @@ from impuls.errors import InputNotModified
 from impuls.model import Date
 from impuls.multi_file import IntermediateFeed, IntermediateFeedProvider, MultiFile
 from impuls.tasks import ExecuteSQL, LoadGTFS, SaveGTFS
+from impuls.tools.color import text_color_for
 
 GTFS_HEADERS = {
     "agency.txt": (
@@ -314,18 +315,10 @@ class UpdateRouteColors(Task):
             r.db.raw_execute_many(
                 "UPDATE routes SET color = ?, text_color = ? WHERE type = ? AND short_name LIKE ?",
                 (
-                    (color[1:], self.text_color_for(color[1:]), type, short_name_pattern)
+                    (color[1:], text_color_for(color), type, short_name_pattern)
                     for short_name_pattern, type, color in ROUTE_COLORS
                 ),
             )
-
-    @staticmethod
-    def text_color_for(color: str) -> str:
-        r = int(color[0:2], base=16)
-        g = int(color[2:4], base=16)
-        b = int(color[4:6], base=16)
-        yiq = 0.299 * r + 0.587 * g + 0.114 * b
-        return "000000" if yiq > 128 else "FFFFFF"
 
 
 class UpdateRouteLongNames(Task):
