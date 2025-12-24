@@ -9,6 +9,7 @@ import shutil
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
+from functools import partial
 from io import TextIOWrapper
 from operator import itemgetter
 from pathlib import Path
@@ -18,9 +19,15 @@ from zipfile import ZipFile
 import requests
 from impuls import App, LocalResource, PipelineOptions, Task, TaskRuntime
 from impuls.errors import InputNotModified
-from impuls.model import Date
+from impuls.model import Attribution, Date
 from impuls.multi_file import IntermediateFeed, IntermediateFeedProvider, MultiFile
-from impuls.tasks import ExecuteSQL, ExtendCalendarsFromPolishExceptions, LoadGTFS, SaveGTFS
+from impuls.tasks import (
+    AddEntity,
+    ExecuteSQL,
+    ExtendCalendarsFromPolishExceptions,
+    LoadGTFS,
+    SaveGTFS,
+)
 from impuls.tools import polish_calendar_exceptions
 from impuls.tools.color import text_color_for
 
@@ -34,6 +41,15 @@ GTFS_HEADERS = {
         "agency_lang",
         "agency_fare_url",
         "agency_email",
+    ),
+    "attributions.txt": (
+        "attribution_id",
+        "organization_name",
+        "is_producer",
+        "is_operator",
+        "is_authority",
+        "is_data_source",
+        "attribution_url",
     ),
     "calendar_dates.txt": (
         "service_id",
@@ -363,6 +379,76 @@ class DeduplicateShapes(Task):
                     deduplicated.add(shape_id)
 
 
+def create_intermediate_pipeline(feed: IntermediateFeed[LocalResource]) -> list[Task]:
+    return [
+        LoadGTFS(feed.resource_name),
+    ]
+
+
+def create_final_pipeline(
+    feeds: list[IntermediateFeed[LocalResource]],
+    output: str,
+    provider: GZMFeedProvider,
+) -> list[Task]:
+    # fetch_time will be naive in local timezone
+    fetch_time = datetime.fromtimestamp(min(i.stat().st_mtime for i in provider.feeds))
+
+    return [
+        UpdateFeedInfo(provider.pkg_date.strftime("%Y.%m.%d")),
+        DeduplicateShapes(),
+        ExecuteSQL(
+            statement=(
+                "DELETE FROM stops WHERE name LIKE 'granica %' AND NOT EXISTS ("
+                "  SELECT 1 FROM stop_times WHERE stops.stop_id = stop_times.stop_id "
+                "  AND (pickup_type != 1 OR drop_off_type != 1)"
+                ")"
+            ),
+            task_name="RemoveMunicipalityBorderFakeStops",
+        ),
+        ExecuteSQL(
+            statement=(
+                "UPDATE routes SET short_name = substr(short_name, 2) "
+                "WHERE type = 0 AND short_name LIKE 'T%'"
+            ),
+            task_name="UpdateTramRouteShortName",
+        ),
+        UpdateRouteColors(),
+        UpdateRouteLongNames(),
+        ExtendCalendarsFromPolishExceptions(
+            resource_name="calendar_exceptions.csv",
+            region=polish_calendar_exceptions.PolishRegion.SLASKIE,
+        ),
+        AddEntity(
+            task_name="AddGZMAttribution",
+            entity=Attribution(
+                id="1",
+                organization_name=(
+                    "Data provided by: Zarząd Transportu Metropolitalnego (retrieved "
+                    f"{fetch_time.strftime('%Y-%m-%d %H:%M:%S')})"
+                ),
+                is_producer=False,
+                is_operator=True,
+                is_authority=True,
+                is_data_source=True,
+                url="https://otwartedane.metropoliagzm.pl/dataset/rozklady-jazdy-i-lokalizacja-przystankow-gtfs-wersja-rozszerzona",
+            ),
+        ),
+        AddEntity(
+            task_name="AddMKuranAttribution",
+            entity=Attribution(
+                id="2",
+                organization_name="GTFS: Mikołaj Kuranowski",
+                is_producer=True,
+                is_operator=False,
+                is_authority=False,
+                is_data_source=True,
+                url="https://mkuran.pl/gtfs/",
+            ),
+        ),
+        SaveGTFS(headers=GTFS_HEADERS, target=output),
+    ]
+
+
 class GZMGTFS(App):
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("-o", "--output", default="gzm.zip", help="path to output GTFS file")
@@ -376,36 +462,12 @@ class GZMGTFS(App):
         return MultiFile(
             options=options,
             intermediate_provider=provider,
-            intermediate_pipeline_tasks_factory=lambda feed: [
-                LoadGTFS(feed.resource_name),
-            ],
-            final_pipeline_tasks_factory=lambda _: [
-                UpdateFeedInfo(provider.pkg_date.strftime("%Y.%m.%d")),
-                DeduplicateShapes(),
-                ExecuteSQL(
-                    statement=(
-                        "DELETE FROM stops WHERE name LIKE 'granica %' AND NOT EXISTS ("
-                        "  SELECT 1 FROM stop_times WHERE stops.stop_id = stop_times.stop_id "
-                        "  AND (pickup_type != 1 OR drop_off_type != 1)"
-                        ")"
-                    ),
-                    task_name="RemoveMunicipalityBorderFakeStops",
-                ),
-                ExecuteSQL(
-                    statement=(
-                        "UPDATE routes SET short_name = substr(short_name, 2) "
-                        "WHERE type = 0 AND short_name LIKE 'T%'"
-                    ),
-                    task_name="UpdateTramRouteShortName",
-                ),
-                UpdateRouteColors(),
-                UpdateRouteLongNames(),
-                ExtendCalendarsFromPolishExceptions(
-                    resource_name="calendar_exceptions.csv",
-                    region=polish_calendar_exceptions.PolishRegion.SLASKIE,
-                ),
-                SaveGTFS(headers=GTFS_HEADERS, target=args.output),
-            ],
+            intermediate_pipeline_tasks_factory=create_intermediate_pipeline,
+            final_pipeline_tasks_factory=partial(
+                create_final_pipeline,
+                output=args.output,
+                provider=provider,
+            ),
             additional_resources={
                 "calendar_exceptions.csv": polish_calendar_exceptions.RESOURCE,
             },
