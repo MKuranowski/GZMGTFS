@@ -11,15 +11,15 @@ from collections.abc import Iterable
 from datetime import date, datetime, timezone
 from functools import partial
 from io import TextIOWrapper
-from operator import itemgetter
+from operator import attrgetter, itemgetter
 from pathlib import Path
 from typing import cast
 from zipfile import ZipFile
 
 import requests
-from impuls import App, LocalResource, PipelineOptions, Task, TaskRuntime
+from impuls import App, DBConnection, LocalResource, PipelineOptions, Task, TaskRuntime
 from impuls.errors import InputNotModified
-from impuls.model import Attribution, Date
+from impuls.model import Attribution, Date, Stop
 from impuls.multi_file import IntermediateFeed, IntermediateFeedProvider, MultiFile
 from impuls.tasks import (
     AddEntity,
@@ -30,6 +30,7 @@ from impuls.tasks import (
 )
 from impuls.tools import polish_calendar_exceptions
 from impuls.tools.color import text_color_for
+from impuls.tools.geo import earth_distance_m
 
 GTFS_HEADERS = {
     "agency.txt": (
@@ -75,7 +76,7 @@ GTFS_HEADERS = {
         "route_text_color",
     ),
     "shapes.txt": ("shape_id", "shape_pt_lat", "shape_pt_lon", "shape_pt_sequence"),
-    "stops.txt": ("stop_id", "stop_code", "stop_name", "stop_lat", "stop_lon"),
+    "stops.txt": ("stop_id", "stop_name", "stop_code", "stop_code_full", "stop_lat", "stop_lon"),
     "stop_times.txt": (
         "trip_id",
         "arrival_time",
@@ -356,6 +357,62 @@ class UpdateRouteLongNames(Task):
         return s
 
 
+class DeduplicateStops(Task):
+    MAX_DIST_M = 15.0
+
+    def execute(self, r: TaskRuntime) -> None:
+        merge_groups = self.group_stops_to_merge(r.db.retrieve_all(Stop))
+        with r.db.transaction():
+            total = 0
+            for merge_group in merge_groups:
+                total += len(merge_group) - 1
+                self.merge_stops(r.db, merge_group)
+        self.logger.info("Deduplicated %d stops", total)
+
+    def group_stops_to_merge(self, stops: Iterable[Stop]) -> list[list[Stop]]:
+        groups = list[list[Stop]]()
+        for similar_stops in self.group_similar_stops(stops).values():
+            if len(similar_stops) > 1:
+                groups.extend(i for i in self.group_close_stops(similar_stops) if len(i) > 1)
+        return groups
+
+    def group_similar_stops(self, stops: Iterable[Stop]) -> defaultdict[str, list[Stop]]:
+        similar_groups = defaultdict[str, list[Stop]](list)
+        for stop in stops:
+            key = stop.code.rstrip("t")
+            similar_groups[key].append(stop)
+        return similar_groups
+
+    def group_close_stops(self, stops: Iterable[Stop]) -> list[list[Stop]]:
+        groups = list[list[Stop]]()
+        for stop in stops:
+            for group in groups:
+                if all(
+                    earth_distance_m(i.lat, i.lon, stop.lat, stop.lon) < self.MAX_DIST_M
+                    for i in group
+                ):
+                    group.append(stop)
+                    break
+            else:
+                groups.append([stop])
+        return groups
+
+    def merge_stops(self, db: DBConnection, stops: list[Stop]) -> None:
+        # Stabilize the order of stops, to ensure consistency across runs
+        stops.sort(key=attrgetter("code", "id"))
+
+        dst_stop_id = stops[0].id
+
+        db.raw_execute_many(
+            "UPDATE stop_times SET stop_id = ? WHERE stop_id = ?",
+            ((dst_stop_id, i.id) for i in stops[1:]),
+        )
+        db.raw_execute_many(
+            "DELETE FROM stops WHERE stop_id = ?",
+            ((i.id,) for i in stops[1:]),
+        )
+
+
 class DeduplicateShapes(Task):
     def execute(self, r: TaskRuntime) -> None:
         deduplicated = set[str]()
@@ -411,6 +468,19 @@ def create_final_pipeline(
                 "WHERE type = 0 AND short_name LIKE 'T%'"
             ),
             task_name="UpdateTramRouteShortName",
+        ),
+        DeduplicateStops(),
+        ExecuteSQL(
+            statement=(
+                "UPDATE stops SET "
+                "code = substr(code, length(code)-1), "
+                "extra_fields_json = json_insert("
+                "  coalesce(extra_fields_json, '{}'),"
+                "  '$.stop_code_full',"
+                "  code"
+                ")"
+            ),
+            task_name="CleanStopCode",
         ),
         UpdateRouteColors(),
         UpdateRouteLongNames(),
